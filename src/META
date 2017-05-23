@@ -1,5 +1,0 @@
-name="owee"
-version="0.1"
-description="Library for decoding Spacetime profiles"
-archive(native)="spacetime_lib.cmxa"
-requires="raw_spacetime owee bigarray unix"

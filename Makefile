@@ -1,29 +1,19 @@
-all: spacetime_lib
 
-spacetime_lib:
-	$(MAKE) -C src
+INSTALL_ARGS := $(if $(PREFIX),--prefix $(PREFIX),)
 
-clean:
-	$(MAKE) -C src $@
+# Default rule
+default:
+	jbuilder build @install
 
-.PHONY: all spacetime_lib clean install uninstall reinstall
-
-DIST_FILES=\
-	src/spacetime_lib.mli	\
-	src/spacetime_lib.ml    \
-	src/spacetime_lib.cmi   \
-	src/spacetime_lib.cmx	\
-	src/spacetime_lib.a	\
-	src/spacetime_lib.cmxa
-
-$(DIST_FILES): spacetime_lib
-
-install: $(DIST_FILES) src/META
-	ocamlfind install spacetime_lib $^
+install:
+	jbuilder install $(INSTALL_ARGS)
 
 uninstall:
-	ocamlfind remove spacetime_lib
+	jbuilder uninstall $(INSTALL_ARGS)
 
-reinstall:
-	-$(MAKE) uninstall
-	$(MAKE) install
+reinstall: uninstall reinstall
+
+clean:
+	rm -rf _build
+
+.PHONY: default install uninstall reinstall clean

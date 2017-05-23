@@ -4,7 +4,7 @@
 (*                                                                        *)
 (*           Mark Shinwell and Leo White, Jane Street Europe              *)
 (*                                                                        *)
-(*   Copyright 2015--2016 Jane Street Group LLC                           *)
+(*   Copyright 2015--2017 Jane Street Group LLC                           *)
 (*                                                                        *)
 (*   All rights reserved.  This file is distributed under the terms of    *)
 (*   the GNU Lesser General Public License version 2.1, with the          *)
@@ -13,6 +13,11 @@
 (**************************************************************************)
 
 open Raw_spacetime_lib
+
+type context =
+  { executable : Elf_locations.t option;
+    frame_table : Frame_table.t;
+    shape_table : Shape_table.t; }
 
 module Position = struct
 
@@ -52,18 +57,18 @@ module Location = struct
   let compare t1 t2 =
     Int64.compare t1.address t2.address
 
-  let create_ocaml ?executable ~frame_table pc =
+  let create_ocaml ~ctx pc =
     let address = Program_counter.OCaml.to_int64 pc in
     let foreign = false in
     let symbol =
-      match executable with
+      match ctx.executable with
       | None -> None
       | Some elf_locations ->
         Elf_locations.function_at_pc elf_locations ~program_counter:address
     in
     let position =
       try
-        let slots = Frame_table.find_exn pc frame_table in
+        let slots = Frame_table.find_exn pc ctx.frame_table in
         List.fold_right (fun slot acc ->
             match Printexc.Slot.location slot with
             | Some location -> location::acc
@@ -74,10 +79,10 @@ module Location = struct
     in
     { address; symbol; position; foreign; }
 
-  let create_foreign ?executable pc =
+  let create_foreign ~ctx pc =
     let program_counter = Program_counter.Foreign.to_int64 pc in
     let position =
-      match executable with
+      match ctx.executable with
       | None -> []
       | Some elf_locations ->
         match Elf_locations.resolve elf_locations ~program_counter with
@@ -94,7 +99,7 @@ module Location = struct
           [location]
     in
     let symbol =
-      match executable with
+      match ctx.executable with
       | None -> None
       | Some elf_locations ->
         Elf_locations.function_at_pc elf_locations ~program_counter
@@ -199,7 +204,7 @@ end = struct
 
 end
 
-module Entry = struct
+module Allocation_entry = struct
 
   type t =
     | Alloc of { backtrace : Backtrace.t;
@@ -231,7 +236,8 @@ module Entry = struct
     | Small { counts } -> Small_count.allocations counts
     | Large { allocations } -> allocations
 
-  let set_allocations new_allocations = function
+  let with_allocations t new_allocations =
+    match t with
     | Alloc { backtrace; allocations } as entry ->
       if allocations = new_allocations then entry
       else Alloc { backtrace; allocations = new_allocations }
@@ -253,6 +259,28 @@ module Entry = struct
     | Large { backtrace; blocks; words; allocations } as entry ->
       if allocations = new_allocations then entry
       else Large { backtrace; blocks; words; allocations = new_allocations }
+
+end
+
+module Call_entry = struct
+
+  type t =
+    | Direct of { backtrace : Backtrace.t;
+                  calls : int; }
+    | Indirect of { backtrace : Backtrace.t;
+                    calls : int; }
+
+  let backtrace = function
+    | Indirect { backtrace; _ } -> backtrace
+    | Direct { backtrace; _ } -> backtrace
+
+  let calls = function
+    | Indirect { calls; _ } -> calls
+    | Direct { calls; _ } -> calls
+
+  let direct = function
+    | Indirect _ -> false
+    | Direct _ -> true
 
 end
 
@@ -427,7 +455,9 @@ module Annotation_data = struct
           loop ~entries ~idx:(idx + 1) ~prev_entry data
         | UpdateAlloc { index; allocations; next } ->
           if index <= idx then begin
-            let entry = Entry.set_allocations allocations prev_entry in
+            let entry =
+              Allocation_entry.with_allocations prev_entry allocations
+            in
             loop ~entries ~idx ~prev_entry:entry next
           end else begin
             entries.(idx) <- prev_entry :: entries.(idx);
@@ -435,8 +465,8 @@ module Annotation_data = struct
           end
         | UpdateSmall { index; counts; next } ->
           if index <= idx then begin
-            let backtrace = Entry.backtrace prev_entry in
-            let entry = Entry.Small { backtrace; counts } in
+            let backtrace = Allocation_entry.backtrace prev_entry in
+            let entry = Allocation_entry.Small { backtrace; counts } in
             loop ~entries ~idx ~prev_entry:entry next
           end else begin
             entries.(idx) <- prev_entry :: entries.(idx);
@@ -444,9 +474,9 @@ module Annotation_data = struct
           end
         | UpdateLarge { index; blocks; words; allocations; next } ->
           if index <= idx then begin
-            let backtrace = Entry.backtrace prev_entry in
+            let backtrace = Allocation_entry.backtrace prev_entry in
             let entry =
-              Entry.Large { backtrace; blocks; words; allocations }
+              Allocation_entry.Large { backtrace; blocks; words; allocations }
             in
             loop ~entries ~idx ~prev_entry:entry next
           end else begin
@@ -458,13 +488,15 @@ module Annotation_data = struct
     match data.updates with
     | Nil -> ()
     | UpdateAlloc { index; allocations; next } ->
-      let entry = Entry.Alloc { backtrace; allocations } in
+      let entry = Allocation_entry.Alloc { backtrace; allocations } in
       loop ~entries ~idx:index ~prev_entry:entry next
     | UpdateSmall { index; counts; next } ->
-      let entry = Entry.Small { backtrace; counts } in
+      let entry = Allocation_entry.Small { backtrace; counts } in
       loop ~entries ~idx:index ~prev_entry:entry next
     | UpdateLarge { index; blocks; words; allocations; next } ->
-      let entry = Entry.Large { backtrace; blocks; words; allocations } in
+      let entry =
+        Allocation_entry.Large { backtrace; blocks; words; allocations }
+      in
       loop ~entries ~idx:index ~prev_entry:entry next
 
 end
@@ -497,155 +529,198 @@ module Snapshot = struct
 
   type t =
     { time : float;
-      stats : Stats.t;
-      entries : Entry.t list;
+      stats : Stats.t option;
+      allocation_entries : Allocation_entry.t list;
     }
 
   let time { time } = time
 
   let stats { stats } = stats
 
-  let entries { entries } = entries
+  let allocation_entries { allocation_entries } = allocation_entries
 
-  let create ~snapshot ~entries =
-    let time = Heap_snapshot.timestamp snapshot in
-    let gc = Heap_snapshot.gc_stats snapshot in
-    let words_scanned = Heap_snapshot.words_scanned snapshot in
-    let words_scanned_with_profinfo =
-      Heap_snapshot.words_scanned_with_profinfo snapshot
+  let create ~snapshot ~allocation_entries =
+    let time, stats =
+      match snapshot with
+      | None -> 0.0, None
+      | Some snapshot ->
+        let time = Heap_snapshot.timestamp snapshot in
+        let gc = Heap_snapshot.gc_stats snapshot in
+        let words_scanned = Heap_snapshot.words_scanned snapshot in
+        let words_scanned_with_profinfo =
+          Heap_snapshot.words_scanned_with_profinfo snapshot
+        in
+        let stats =
+          { Stats.gc; words_scanned; words_scanned_with_profinfo; }
+        in
+        time, Some stats
     in
-    let stats =
-      { Stats.gc; words_scanned; words_scanned_with_profinfo; }
-    in
-    { time; stats; entries; }
+    { time; stats; allocation_entries; }
 
 end
 
 module Series = struct
 
-  type t = Snapshot.t list
+  type t =
+    { snapshots : Snapshot.t list;
+      call_entries : Call_entry.t list;
+      has_call_counts : bool;
+      final_time : float; }
+
+  type 'a entry_kind =
+    | Allocation : Annotation.t entry_kind
+    | Direct_call : int entry_kind
+    | Indirect_call : int entry_kind
+
+  type iterator =
+    { f: 'a. 'a entry_kind -> Backtrace.t -> 'a -> unit }
 
   let iter_opt f opt k =
     match opt with
     | None -> k ()
     | Some x -> f x k
 
-  let rec iter_ocaml_indirect_calls ?executable ~frame_table ~shape_table
-            visited f backtrace callee k =
-    let node = Trace.OCaml.Indirect_call_point.Callee.callee_node callee in
-    iter_node
-      ?executable ~frame_table ~shape_table visited f backtrace node (fun () ->
+  let rec iter_ocaml_indirect_calls ~ctx ~visited f backtrace callee k =
     let next = Trace.OCaml.Indirect_call_point.Callee.next callee in
-    iter_opt
-      (iter_ocaml_indirect_calls ?executable ~frame_table ~shape_table
-         visited f backtrace)
-      next k)
+    let k =
+      match next with
+      | None -> k
+      | Some next ->
+        fun () ->
+          iter_ocaml_indirect_calls ~ctx ~visited f backtrace next k
+    in
+    let node = Trace.OCaml.Indirect_call_point.Callee.callee_node callee in
+    let count = Versioned.indirect_call_count callee in
+    let () =
+      match count with
+      | None -> ()
+      | Some count -> f.f Indirect_call backtrace count
+    in
+    iter_node ~ctx ~visited f backtrace node k
 
-  and iter_ocaml_field_classification ?executable ~frame_table ~shape_table
-        visited f backtrace classification k =
+  and iter_ocaml_field_classification ~ctx
+        ~visited f backtrace classification k =
     match classification with
     | Trace.OCaml.Field.Allocation alloc ->
       let pc = Trace.OCaml.Allocation_point.program_counter alloc in
-      let loc = Location.create_ocaml ?executable ~frame_table pc in
+      let loc = Location.create_ocaml ~ctx pc in
       let annot = Trace.OCaml.Allocation_point.annotation alloc in
-      f (loc :: backtrace) annot;
+      f.f Allocation (loc :: backtrace) annot;
       k ()
     | Trace.OCaml.Field.Direct_call (Trace.OCaml.Field.To_ocaml call) ->
-      let site = Trace.OCaml.Direct_call_point.call_site call in
-      let loc = Location.create_ocaml ?executable ~frame_table site in
       let node = Trace.OCaml.Direct_call_point.callee_node call in
-      iter_ocaml_node ?executable ~frame_table ~shape_table
-        visited f (loc :: backtrace) node k
+      let count = Versioned.direct_call_count call in
+      let site = Trace.OCaml.Direct_call_point.call_site call in
+      let loc = Location.create_ocaml ~ctx site in
+      let backtrace = loc :: backtrace in
+      let () =
+        match count with
+        | None -> ()
+        | Some count -> f.f Direct_call backtrace count
+      in
+      iter_ocaml_node ~ctx ~visited f backtrace node k
     | Trace.OCaml.Field.Direct_call (Trace.OCaml.Field.To_foreign call) ->
       let site = Trace.OCaml.Direct_call_point.call_site call in
-      let loc = Location.create_ocaml ?executable ~frame_table site in
       let node = Trace.OCaml.Direct_call_point.callee_node call in
-      iter_foreign_node ?executable ~frame_table ~shape_table
-        visited f (loc :: backtrace) node k
+      let loc = Location.create_ocaml ~ctx site in
+      let backtrace = loc :: backtrace in
+      let count = Versioned.direct_call_count call in
+      let () =
+        match count with
+        | None -> ()
+        | Some count -> f.f Direct_call backtrace count
+      in
+      iter_foreign_node ~ctx ~visited f backtrace node k
     | Trace.OCaml.Field.Direct_call
         (Trace.OCaml.Field.To_uninstrumented _) -> k ()
     | Trace.OCaml.Field.Indirect_call call ->
       let site = Trace.OCaml.Indirect_call_point.call_site call in
-      let loc = Location.create_ocaml ?executable ~frame_table site in
       let callee = Trace.OCaml.Indirect_call_point.callees call in
+      let loc = Location.create_ocaml ~ctx site in
+      let backtrace = loc :: backtrace in
       iter_opt
-        (iter_ocaml_indirect_calls ?executable ~frame_table ~shape_table
-           visited f (loc :: backtrace))
+        (iter_ocaml_indirect_calls ~ctx ~visited f backtrace)
         callee k
 
-  and iter_ocaml_fields ?executable ~frame_table ~shape_table
-        visited f backtrace field k =
-    iter_ocaml_field_classification ?executable ~frame_table ~shape_table
-        visited f backtrace (Trace.OCaml.Field.classify field) (fun () ->
-    iter_opt
-      (iter_ocaml_fields ?executable ~frame_table ~shape_table
-        visited f backtrace)
-      (Trace.OCaml.Field.next field) k)
+  and iter_ocaml_fields ~ctx ~visited f backtrace field k =
+    let next = Trace.OCaml.Field.next field in
+    let k =
+      match next with
+      | None -> k
+      | Some next ->
+        fun () ->
+          iter_ocaml_fields ~ctx ~visited f backtrace next k
+    in
+    iter_ocaml_field_classification ~ctx ~visited
+      f backtrace (Trace.OCaml.Field.classify field) k
 
-  and iter_ocaml_node ?executable ~frame_table ~shape_table visited f
-        backtrace node k =
+  and iter_ocaml_node ~ctx ~visited f backtrace node k =
     if Trace.Node.Set.mem (Trace.Node.of_ocaml_node node) !visited then k ()
     else begin
       visited := Trace.Node.Set.add (Trace.Node.of_ocaml_node node) !visited;
-      iter_ocaml_node
-        ?executable ~frame_table ~shape_table visited f backtrace
-        (Trace.OCaml.Node.next_in_tail_call_chain node) (fun () ->
-      iter_opt
-        (iter_ocaml_fields
-          ?executable ~frame_table ~shape_table visited f backtrace)
-        (Trace.OCaml.Node.fields node ~shape_table) k)
+      let shape_table = ctx.shape_table in
+      let fields = Trace.OCaml.Node.fields node ~shape_table in
+      let k =
+        match fields with
+        | None -> k
+        | Some fields ->
+          fun () ->
+            iter_ocaml_fields ~ctx ~visited
+              f backtrace fields k
+      in
+      iter_ocaml_node ~ctx ~visited f backtrace
+        (Trace.OCaml.Node.next_in_tail_call_chain node) k
     end
 
-  and iter_foreign_field_classification ?executable ~frame_table ~shape_table
-        visited f backtrace classification k =
+  and iter_foreign_field_classification ~ctx
+        ~visited f backtrace classification k =
     match classification with
     | Trace.Foreign.Field.Allocation alloc ->
       let pc = Trace.Foreign.Allocation_point.program_counter alloc in
-      let loc = Location.create_foreign ?executable pc in
+      let loc = Location.create_foreign ~ctx pc in
       let annot = Trace.Foreign.Allocation_point.annotation alloc in
-      f (loc :: backtrace) annot;
+      f.f Allocation (loc :: backtrace) annot;
       k ()
     | Trace.Foreign.Field.Call call ->
       let site = Trace.Foreign.Call_point.call_site call in
-      let loc = Location.create_foreign ?executable site in
+      let loc = Location.create_foreign ~ctx site in
       let node = Trace.Foreign.Call_point.callee_node call in
-      iter_node ?executable ~frame_table ~shape_table
-        visited f (loc :: backtrace) node k
+      iter_node ~ctx ~visited f (loc :: backtrace) node k
 
-  and iter_foreign_fields ?executable ~frame_table ~shape_table
-        visited f backtrace field k =
-    iter_foreign_field_classification ?executable ~frame_table ~shape_table
-        visited f backtrace (Trace.Foreign.Field.classify field) (fun () ->
-    iter_opt
-      (iter_foreign_fields ?executable ~frame_table ~shape_table
-         visited f backtrace)
-      (Trace.Foreign.Field.next field) k)
+  and iter_foreign_fields ~ctx ~visited f backtrace field k =
+    let next = Trace.Foreign.Field.next field in
+    let k =
+      match next with
+      | None -> k
+      | Some next ->
+        fun () ->
+          iter_foreign_fields ~ctx ~visited f backtrace next k
+    in
+    iter_foreign_field_classification ~ctx
+      ~visited f backtrace (Trace.Foreign.Field.classify field) k
 
-  and iter_foreign_node ?executable ~frame_table ~shape_table visited f
-        backtrace node k =
+  and iter_foreign_node ~ctx ~visited f backtrace node k =
     iter_opt
-      (iter_foreign_fields ?executable ~frame_table ~shape_table
-         visited f backtrace)
+      (iter_foreign_fields ~ctx ~visited f backtrace)
       (Trace.Foreign.Node.fields node) k
 
-  and iter_node ?executable ~frame_table ~shape_table visited f backtrace
-        node k =
+  and iter_node ~ctx ~visited f backtrace node k =
     match Trace.Node.classify node with
     | Trace.Node.OCaml node ->
-      iter_ocaml_node ?executable ~frame_table ~shape_table visited f
+      iter_ocaml_node ~ctx ~visited f
         backtrace node k
     | Trace.Node.Foreign node ->
-      iter_foreign_node ?executable ~frame_table ~shape_table visited f
-        backtrace node k
+      iter_foreign_node ~ctx ~visited f backtrace node k
 
-  let iter_trace ?executable ~frame_table ~shape_table f trace k =
+  let iter_trace ~ctx f trace k =
     match Trace.root trace with
     | None -> ()
     | Some node ->
       let visited = ref Trace.Node.Set.empty in
-      iter_node ?executable ~frame_table ~shape_table visited f [] node k
+      iter_node ~ctx ~visited f [] node k
 
   let iter_traces ?executable ~series ~frame_table ~shape_table f =
+    let ctx = { executable; frame_table; shape_table } in
     let num_threads = Heap_snapshot.Series.num_threads series in
     let rec loop n =
       if n >= num_threads then ()
@@ -653,16 +728,12 @@ module Series = struct
         let normal =
           Heap_snapshot.Series.trace series Heap_snapshot.Series.Normal n
         in
-        iter_opt
-          (iter_trace ?executable ~frame_table ~shape_table f)
-          normal (fun () ->
+        iter_opt (iter_trace ~ctx f) normal ignore;
         let finaliser =
           Heap_snapshot.Series.trace series Heap_snapshot.Series.Finaliser n
         in
-        iter_opt
-          (iter_trace ?executable ~frame_table ~shape_table f)
-          finaliser ignore;
-        loop (n + 1))
+        iter_opt (iter_trace ~ctx f) finaliser ignore;
+        loop (n + 1)
       end
     in
     loop 0
@@ -722,8 +793,12 @@ module Series = struct
       snapshots;
     tbl
 
+  type mode = For_allocations | For_calls
+
   let create ?executable path =
     let series = Heap_snapshot.Series.read ~path in
+    let has_call_counts = Versioned.has_call_counts series in
+    let final_time = Heap_snapshot.Series.time_of_writer_close series in
     let executable =
       match executable with
       | None -> None
@@ -745,19 +820,44 @@ module Series = struct
     in
     let num_snapshots = List.length snapshots in
     let data_table = data_table ~num_snapshots ~snapshots in
-    let entries = Array.make num_snapshots [] in
-    let accumulate backtrace annot =
-      match Hashtbl.find data_table annot with
-      | exception Not_found -> ()
-      | data ->
-        Annotation_data.store_entries ~backtrace ~data ~entries
+    let allocation_entries = Array.make num_snapshots [] in
+    let call_entries = ref [] in
+    let accumulate (type a) (kind : a entry_kind) backtrace (annot : a) =
+      match kind with
+      | Allocation -> begin
+          match Hashtbl.find data_table annot with
+          | exception Not_found -> ()
+          | data ->
+            Annotation_data.store_entries ~backtrace ~data
+              ~entries:allocation_entries
+        end
+      | Direct_call -> begin
+          let calls = annot in
+          let entry = Call_entry.Direct { backtrace; calls } in
+          call_entries := entry :: !call_entries
+        end
+      | Indirect_call -> begin
+          let calls = annot in
+          let entry = Call_entry.Indirect { backtrace; calls } in
+          call_entries := entry :: !call_entries
+        end
     in
-    iter_traces ?executable ~series ~frame_table ~shape_table accumulate;
+    iter_traces ?executable ~series ~frame_table ~shape_table
+      {f = accumulate};
     let snapshots =
-      List.map2
-        (fun snapshot entries -> Snapshot.create ~snapshot ~entries)
-        snapshots (Array.to_list entries)
+      List.map2 (fun snapshot allocation_entries ->
+          Snapshot.create ~snapshot:(Some snapshot) ~allocation_entries)
+        snapshots (Array.to_list allocation_entries)
     in
-    snapshots
+    let call_entries = !call_entries in
+    { snapshots; call_entries; has_call_counts; final_time }
+
+  let snapshots { snapshots; _ } = snapshots
+
+  let call_entries { call_entries; _ } = call_entries
+
+  let has_call_counts { has_call_counts; _ } = has_call_counts
+
+  let final_time { final_time; _ } = final_time
 
 end
