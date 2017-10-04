@@ -16,4 +16,7 @@ reinstall: uninstall reinstall
 clean:
 	rm -rf _build
 
+distclean: clean
+	rm src/versioned.ml
+
 .PHONY: default install uninstall reinstall clean
