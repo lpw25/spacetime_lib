@@ -1,3 +1,4 @@
+#! /bin/bash
 
 MAJOR=`ocamlc -config | sed -n 's/^version: *\(.*\)\.\(.*\)\\.\(.*\).*$/\1/p'`
 MINOR=`ocamlc -config | sed -n 's/^version: *\(.*\)\.\(.*\)\\.\(.*\).*$/\2/p'`
@@ -17,5 +18,5 @@ if [ "$MAJOR" = "4" ]; then
         ln -s ./versioned/4.06/versioned.ml src
     fi
 else
-    echo "OCaml version $MAJOR.$MINOR not supported"i
+    echo "OCaml version $MAJOR.$MINOR not supported"
 fi
