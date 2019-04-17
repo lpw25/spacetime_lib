@@ -9,10 +9,10 @@ license: "MIT"
 dev-repo: "git://github.com/lpw25/spacetime_lib"
 build: [
   ["./configure.sh"]
-  ["jbuilder" "build" "-p" name "-j" jobs]
+  ["dune" "build" "-p" name "-j" jobs]
 ]
 depends: [
-  "jbuilder" {build}
+  "dune" {build & >= "1.0"}
   "ocamlfind" {build}
   "owee"
   "raw_spacetime"
