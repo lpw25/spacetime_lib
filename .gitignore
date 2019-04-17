@@ -5,3 +5,6 @@
 *.cmxa
 *.o
 *.a
+.merlin
+src/versioned.ml
+*.install
