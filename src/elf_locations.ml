@@ -12,7 +12,7 @@ let create ~elf_executable =
   let fd = Unix.openfile elf_executable [Unix.O_RDONLY] 0 in
   let len = Unix.lseek fd 0 Unix.SEEK_END in
   let map =
-    Bigarray.Array1.map_file fd
+    Versioned.map_file fd
       Bigarray.int8_unsigned Bigarray.c_layout false len
   in
   Unix.close fd;
