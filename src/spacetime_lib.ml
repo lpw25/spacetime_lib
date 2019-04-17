@@ -23,13 +23,13 @@ module Position = struct
 
   type t = Printexc.location
 
-  let filename { Printexc.filename } = filename
+  let filename { Printexc.filename; _ } = filename
 
-  let line_number { Printexc.line_number } = line_number
+  let line_number { Printexc.line_number; _ } = line_number
 
-  let start_char { Printexc.start_char } = start_char
+  let start_char { Printexc.start_char; _ } = start_char
 
-  let end_char { Printexc.end_char } = end_char
+  let end_char { Printexc.end_char; _ } = end_char
 
   let print ppf t =
     let open Printexc in
@@ -46,16 +46,13 @@ module Location = struct
       position : Position.t list;
       foreign : bool; }
 
-  let address { address } = address
+  let address { address; _ } = address
 
-  let symbol { symbol } = symbol
+  let symbol { symbol; _ } = symbol
 
-  let position { position } = position
+  let position { position; _ } = position
 
-  let foreign { foreign } = foreign
-
-  let compare t1 t2 =
-    Int64.compare t1.address t2.address
+  let foreign { foreign; _ } = foreign
 
   let create_ocaml ~ctx pc =
     let address = Program_counter.OCaml.to_int64 pc in
@@ -125,16 +122,6 @@ end
 module Backtrace = struct
 
   type t = Location.t list
-
-  let rec compare b1 b2 =
-    match b1, b2 with
-    | [], [] -> 0
-    | l1 :: b1, l2 :: b2 ->
-      let c = Location.compare l1 l2 in
-      if c <> 0 then c
-      else compare b1 b2
-    | _ :: _, [] -> 1
-    | [], _ :: _ -> -1
 
   let rec print ppf = function
     | [] -> ()
@@ -217,24 +204,24 @@ module Allocation_entry = struct
                  allocations : int; }
 
   let backtrace = function
-    | Alloc { backtrace } -> backtrace
-    | Small { backtrace } -> backtrace
-    | Large { backtrace } -> backtrace
+    | Alloc { backtrace; _ } -> backtrace
+    | Small { backtrace; _ } -> backtrace
+    | Large { backtrace; _ } -> backtrace
 
   let blocks = function
     | Alloc _ -> 0
-    | Small { counts } -> Small_count.blocks counts
-    | Large { blocks } -> blocks
+    | Small { counts; _ } -> Small_count.blocks counts
+    | Large { blocks; _ } -> blocks
 
   let words = function
     | Alloc _ -> 0
-    | Small { counts } -> Small_count.words counts
-    | Large { words } -> words
+    | Small { counts; _ } -> Small_count.words counts
+    | Large { words; _ } -> words
 
   let allocations = function
-    | Alloc { allocations } -> allocations
-    | Small { counts } -> Small_count.allocations counts
-    | Large { allocations } -> allocations
+    | Alloc { allocations; _ } -> allocations
+    | Small { counts; _ } -> Small_count.allocations counts
+    | Large { allocations; _ } -> allocations
 
   let with_allocations t new_allocations =
     match t with
@@ -518,9 +505,9 @@ module Stats = struct
   let compactions t = Gc_stats.compactions t.gc
   let top_heap_words t = Gc_stats.top_heap_words t.gc
 
-  let words_scanned { words_scanned } = words_scanned
+  let words_scanned { words_scanned; _ } = words_scanned
 
-  let words_scanned_with_profinfo { words_scanned_with_profinfo } =
+  let words_scanned_with_profinfo { words_scanned_with_profinfo; _ } =
     words_scanned_with_profinfo
 
 end
@@ -533,11 +520,11 @@ module Snapshot = struct
       allocation_entries : Allocation_entry.t list;
     }
 
-  let time { time } = time
+  let time { time; _ } = time
 
-  let stats { stats } = stats
+  let stats { stats; _ } = stats
 
-  let allocation_entries { allocation_entries } = allocation_entries
+  let allocation_entries { allocation_entries; _ } = allocation_entries
 
   let create ~snapshot ~allocation_entries =
     let time, stats =
@@ -726,11 +713,13 @@ module Series = struct
       if n >= num_threads then ()
       else begin
         let normal =
-          Heap_snapshot.Series.trace series Heap_snapshot.Series.Normal n
+          Heap_snapshot.Series.trace series
+            ~kind:Heap_snapshot.Series.Normal ~thread_index:n
         in
         iter_opt (iter_trace ~ctx f) normal ignore;
         let finaliser =
-          Heap_snapshot.Series.trace series Heap_snapshot.Series.Finaliser n
+          Heap_snapshot.Series.trace series
+            ~kind:Heap_snapshot.Series.Finaliser ~thread_index:n
         in
         iter_opt (iter_trace ~ctx f) finaliser ignore;
         loop (n + 1)
@@ -792,8 +781,6 @@ module Series = struct
          loop (Heap_snapshot.total_allocations snapshot))
       snapshots;
     tbl
-
-  type mode = For_allocations | For_calls
 
   let create ?executable path =
     let series = Heap_snapshot.Series.read ~path in

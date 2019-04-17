@@ -21,6 +21,8 @@ module Position : sig
   val start_char : t -> int
   val end_char : t -> int
 
+  val print : Format.formatter -> t -> unit
+
 end
 
 module Location : sig
@@ -36,11 +38,15 @@ module Location : sig
   val position : t -> Position.t list
   val foreign : t -> bool
 
+  val print : Format.formatter -> t -> unit
+
 end
 
 module Backtrace : sig
 
   type t = Location.t list
+
+  val print : Format.formatter -> t -> unit
 
 end
 
